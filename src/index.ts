@@ -1,14 +1,14 @@
 /**
  * @file index.ts
- * @description Bot de Telegram para descarga de videos sin marcas de agua (YouTube, Instagram, Facebook, Pinterest)
- * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), `@distube/ytdl-core` (importado correctamente como módulo *),
- * análisis nativo para Pinterest, respuestas amigables con emojis y Estrellas de Telegram.
+ * @description Bot de Telegram para descarga de videos sin marcas de agua (YouTube, Pinterest)
+ * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), extracción 100% nativa en JavaScript puro
+ * (analizando metadatos HTML y `ytInitialPlayerResponse` para YouTube, y `__PWS_DATA__` para Pinterest),
+ * sin APIs de terceros, con respuestas amigables con emojis y Estrellas de Telegram.
  * 
  * REGLA DE ORO: Todo el código está comentado detalladamente línea por línea y bloque por bloque en español.
  */
 
 import { Hono } from 'hono';
-import * as ytdl from '@distube/ytdl-core';
 
 /**
  * Interfaz que define las ligaduras (Bindings) inyectadas por Cloudflare Workers.
@@ -99,7 +99,7 @@ app.post('/webhook', async (c) => {
         token,
         chatId,
         '👋 ¡Hola! Bienvenido a tu Bot de Descarga de Videos favorito 🎥✨\n\n' +
-        '📥 Envíame un enlace de **YouTube, Instagram, Facebook o Pinterest** y te enviaré el video limpio y sin marcas de agua.\n\n' +
+        '📥 Envíame un enlace de **YouTube o Pinterest** y te enviaré el video limpio y sin marcas de agua.\n\n' +
         '🎁 **Nuestras Reglas:**\n' +
         '• Tienes **1 descarga gratis todos los días** 🌟\n' +
         '• Las descargas adicionales cuestan solo **20 Estrellas** de Telegram ⭐️\n\n' +
@@ -117,10 +117,6 @@ app.post('/webhook', async (c) => {
         'Simplemente copia y pega enlaces de estas plataformas:\n\n' +
         '▶️ **YouTube:**\n' +
         '`https://youtu.be/oxNK7VBizac`\n\n' +
-        '📸 **Instagram:**\n' +
-        '`https://www.instagram.com/reel/...`\n\n' +
-        '📘 **Facebook:**\n' +
-        '`https://fb.watch/...`\n\n' +
         '📌 **Pinterest:**\n' +
         '`https://pin.it/...`\n\n' +
         '🛡️ *Tip:* Si una descarga falla por motivos ajenos a nosotros, **tu descarga gratuita no se consume**. ¡Puedes reintentar con confianza! 🎯'
@@ -343,28 +339,55 @@ function findPinterestMp4Url(obj: any): string | null {
 }
 
 /**
- * Extrae la URL directa de descarga sin marcas de agua utilizando `@distube/ytdl-core` para YouTube
- * y análisis nativo (Scraping de __PWS_DATA__) para Pinterest.
+ * Extrae la URL directa de descarga sin marcas de agua utilizando extracción 100% nativa en JavaScript puro.
+ * - YouTube: Realiza fetch a la página de YouTube, extrae el reproductor JSON `ytInitialPlayerResponse` y obtiene el stream directo.
+ * - Pinterest: Realiza scraping del JSON interno `__PWS_DATA__` para extraer archivos `.mp4` limpios.
  * 
  * @param pageUrl URL pública del video aportada por el usuario.
  * @returns Retorna la URL directa del archivo `.mp4` o null si falla.
  */
 async function extractDirectVideoUrl(pageUrl: string): Promise<string | null> {
-  console.log('DEBUG: Iniciando extraccion nativa para: ' + pageUrl);
+  console.log('DEBUG: Iniciando extraccion nativa en JS puro para: ' + pageUrl);
 
-  // 1. Extracción nativa de YouTube utilizando @distube/ytdl-core
+  // 1. Extracción 100% nativa de YouTube analizando la página web y su JSON interno (ytInitialPlayerResponse)
   try {
-    if (ytdl.validateURL(pageUrl)) {
-      console.log('DEBUG: Validado URL de YouTube. Resolviendo info con ytdl-core...');
-      const info = await ytdl.getInfo(pageUrl);
-      const format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'videoandaudio' });
-      if (format && format.url) {
-        console.log('SUCCESS: Stream directo de YouTube obtenido con ytdl-core.');
-        return format.url;
+    if (pageUrl.includes('youtube.com') || pageUrl.includes('youtu.be')) {
+      console.log('DEBUG: Analizando pagina de YouTube de forma nativa...');
+      const res = await fetch(pageUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        redirect: 'follow',
+      });
+
+      const html = await res.text();
+      console.log('DEBUG: YouTube response status: ' + res.status + ', length: ' + html.length);
+
+      // Busca el objeto ytInitialPlayerResponse embebido en el HTML de YouTube
+      const ytMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/i) 
+                   || html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/i);
+
+      if (ytMatch && ytMatch[1]) {
+        try {
+          const ytJson = JSON.parse(ytMatch[1]);
+          const formats = ytJson?.streamingData?.formats || ytJson?.streamingData?.adaptiveFormats;
+          if (formats && formats.length > 0) {
+            // Busca un formato que tenga URL directa (preferiblemente con video y audio)
+            const validFormat = formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4'));
+            if (validFormat && validFormat.url) {
+              console.log('SUCCESS: Stream directo de YouTube extraido nativamente.');
+              return validFormat.url;
+            }
+          }
+        } catch (parseErr) {
+          console.error('ERROR: Error parseando ytInitialPlayerResponse JSON:', parseErr);
+        }
       }
+      console.warn('WARN: No se pudo extraer formato directo de YouTube en el HTML.');
     }
   } catch (e) {
-    console.error('ERROR: ytdl-core fallo al procesar YouTube:', e);
+    console.error('ERROR: Excepcion en extraccion nativa de YouTube:', e);
   }
 
   // 2. Extracción nativa para Pinterest (analizando __PWS_DATA__ JSON y archivos .mp4)
@@ -408,10 +431,6 @@ async function extractDirectVideoUrl(pageUrl: string): Promise<string | null> {
   console.error('ERROR CRITICO: Todos los metodos de extraccion nativa fallaron para:', pageUrl);
   return null;
 }
-
-app.post('/reset-db', async (c) => {
-  return c.text('DB reset endpoint ready');
-});
 
 app.post('/reset-db', async (c) => {
   return c.text('DB reset endpoint ready');

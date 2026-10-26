@@ -9,4 +9,4 @@ compatibility_flags = ["nodejs_compat"]
 [[d1_databases]]
 binding = "DB"
 database_name = "telegram-bot-db"
-database_id = "YOUR_D1_DATABASE_ID_HERE"
+database_id = "cbaf0d83-dcea-4cca-8ec3-7abc47765800"

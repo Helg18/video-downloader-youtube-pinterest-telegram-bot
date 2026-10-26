@@ -8,7 +8,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@distube/ytdl-core": "^5.0.2",
     "hono": "^4.6.0"
   },
   "devDependencies": {
