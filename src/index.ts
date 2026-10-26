@@ -1,9 +1,8 @@
 /**
  * @file index.ts
  * @description Bot de Telegram para descarga de videos sin marcas de agua (YouTube, Pinterest)
- * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), extracción 100% nativa en JavaScript puro
- * (analizando metadatos HTML y `ytInitialPlayerResponse` para YouTube, y `__PWS_DATA__` para Pinterest),
- * sin APIs de terceros, con respuestas amigables con emojis y Estrellas de Telegram.
+ * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), integración con RapidAPI para YouTube,
+ * análisis nativo para Pinterest, respuestas amigables con emojis y Estrellas de Telegram.
  * 
  * REGLA DE ORO: Todo el código está comentado detalladamente línea por línea y bloque por bloque en español.
  */
@@ -14,10 +13,12 @@ import { Hono } from 'hono';
  * Interfaz que define las ligaduras (Bindings) inyectadas por Cloudflare Workers.
  * - DB: Conexión a la base de datos Cloudflare D1 (SQLite).
  * - BOT_TOKEN: Token secreto del bot de Telegram obtenido a través de BotFather.
+ * - RAPIDAPI_KEY: Clave de RapidAPI para garantizar descargas estables de YouTube.
  */
 type Bindings = {
   DB: D1Database;
   BOT_TOKEN: string;
+  RAPIDAPI_KEY?: string;
 };
 
 /**
@@ -76,7 +77,7 @@ app.post('/webhook', async (c) => {
 
       if (pending) {
         await sendMessage(token, chatId, '✨ ¡Pago recibido con éxito! Procesando tu video sin marcas de agua... 🎬');
-        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true);
+        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true, c.env.RAPIDAPI_KEY);
         
         await c.env.DB.prepare(
           `INSERT INTO user_purchases (user_id, purchase_count, total_stars_spent)
@@ -165,7 +166,7 @@ app.post('/webhook', async (c) => {
     const videoUrl = matches[0];
     console.log('INFO: Usuario ' + userId + ' solicito descarga para la URL: ' + videoUrl);
 
-    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl);
+    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl, c.env.RAPIDAPI_KEY);
 
     return c.json({ ok: true });
   } catch (err: any) {
@@ -248,7 +249,7 @@ async function sendVideo(token: string, chatId: number | string, directVideoUrl:
 /**
  * Administra la lógica de cuota diaria o emisión de factura de pago.
  */
-async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string) {
+async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string, rapidApiKey?: string) {
   const today = new Date().toISOString().split('T')[0];
 
   const record = await db.prepare(
@@ -259,7 +260,7 @@ async function handleVideoRequest(token: string, db: D1Database, userId: string,
 
   if (successCount < 1) {
     await sendMessage(token, chatId, '⏳ ¡Procesando tu video mágico! Dame un momentito... ✨');
-    await processAndSendVideo(token, db, userId, chatId, videoUrl, false);
+    await processAndSendVideo(token, db, userId, chatId, videoUrl, false, rapidApiKey);
   } else {
     const payload = 'dl_' + userId + '_' + Date.now();
     await db.prepare(
@@ -279,10 +280,11 @@ async function processAndSendVideo(
   userId: string,
   chatId: number | string,
   videoUrl: string,
-  isPaid: boolean
+  isPaid: boolean,
+  rapidApiKey?: string
 ) {
   try {
-    const directUrl = await extractDirectVideoUrl(videoUrl);
+    const directUrl = await extractDirectVideoUrl(videoUrl, rapidApiKey);
 
     if (!directUrl) {
       await sendMessage(
@@ -317,7 +319,7 @@ async function processAndSendVideo(
 }
 
 /**
- * Función recursiva para buscar únicamente URLs de video `.mp4` en objetos JSON anidados (excluyendo `.m3u8`).
+ * Función recursiva para buscar únicamente URLs de video `.mp4` en objetos JSON anidados (Pinterest).
  */
 function findPinterestMp4Url(obj: any): string | null {
   if (!obj || typeof obj !== 'object') return null;
@@ -339,55 +341,45 @@ function findPinterestMp4Url(obj: any): string | null {
 }
 
 /**
- * Extrae la URL directa de descarga sin marcas de agua utilizando extracción 100% nativa en JavaScript puro.
- * - YouTube: Realiza fetch a la página de YouTube, extrae el reproductor JSON `ytInitialPlayerResponse` y obtiene el stream directo.
- * - Pinterest: Realiza scraping del JSON interno `__PWS_DATA__` para extraer archivos `.mp4` limpios.
+ * Extrae la URL directa de descarga sin marcas de agua utilizando RapidAPI para YouTube
+ * y análisis nativo (`__PWS_DATA__`) para Pinterest.
  * 
  * @param pageUrl URL pública del video aportada por el usuario.
+ * @param rapidApiKey Clave de RapidAPI.
  * @returns Retorna la URL directa del archivo `.mp4` o null si falla.
  */
-async function extractDirectVideoUrl(pageUrl: string): Promise<string | null> {
-  console.log('DEBUG: Iniciando extraccion nativa en JS puro para: ' + pageUrl);
+async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Promise<string | null> {
+  console.log('DEBUG: Iniciando extraccion para: ' + pageUrl);
 
-  // 1. Extracción 100% nativa de YouTube analizando la página web y su JSON interno (ytInitialPlayerResponse)
-  try {
-    if (pageUrl.includes('youtube.com') || pageUrl.includes('youtu.be')) {
-      console.log('DEBUG: Analizando pagina de YouTube de forma nativa...');
-      const res = await fetch(pageUrl, {
+  // 1. Extracción de YouTube utilizando RapidAPI
+  if (rapidApiKey) {
+    try {
+      console.log('DEBUG: Consultando YouTube Media Downloader en RapidAPI...');
+      const response = await fetch('https://youtube-media-downloader.p.rapidapi.com/v2/video/details?url=' + encodeURIComponent(pageUrl), {
+        method: 'GET',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
+          'X-RapidAPI-Key': rapidApiKey,
+          'X-RapidAPI-Host': 'youtube-media-downloader.p.rapidapi.com',
         },
-        redirect: 'follow',
       });
+      const data = await response.json() as any;
+      console.log('DEBUG: RapidAPI response status:', response.status);
 
-      const html = await res.text();
-      console.log('DEBUG: YouTube response status: ' + res.status + ', length: ' + html.length);
+      // Intenta múltiples formatos de respuesta comunes de RapidAPI
+      const directUrl = data?.videos?.items?.[0]?.url 
+                     || data?.link 
+                     || data?.url 
+                     || data?.formats?.[0]?.url;
 
-      // Busca el objeto ytInitialPlayerResponse embebido en el HTML de YouTube
-      const ytMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?});<\/script>/i) 
-                   || html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/i);
-
-      if (ytMatch && ytMatch[1]) {
-        try {
-          const ytJson = JSON.parse(ytMatch[1]);
-          const formats = ytJson?.streamingData?.formats || ytJson?.streamingData?.adaptiveFormats;
-          if (formats && formats.length > 0) {
-            // Busca un formato que tenga URL directa (preferiblemente con video y audio)
-            const validFormat = formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4'));
-            if (validFormat && validFormat.url) {
-              console.log('SUCCESS: Stream directo de YouTube extraido nativamente.');
-              return validFormat.url;
-            }
-          }
-        } catch (parseErr) {
-          console.error('ERROR: Error parseando ytInitialPlayerResponse JSON:', parseErr);
-        }
+      if (directUrl) {
+        console.log('SUCCESS: Video de YouTube obtenido mediante RapidAPI.');
+        return directUrl;
       }
-      console.warn('WARN: No se pudo extraer formato directo de YouTube en el HTML.');
+    } catch (e) {
+      console.error('ERROR: Fallo la peticion a RapidAPI:', e);
     }
-  } catch (e) {
-    console.error('ERROR: Excepcion en extraccion nativa de YouTube:', e);
+  } else {
+    console.warn('ADVERTENCIA: RAPIDAPI_KEY no esta configurada en los secretos de Cloudflare.');
   }
 
   // 2. Extracción nativa para Pinterest (analizando __PWS_DATA__ JSON y archivos .mp4)
@@ -428,7 +420,7 @@ async function extractDirectVideoUrl(pageUrl: string): Promise<string | null> {
     console.error('ERROR: Excepcion analizando Pinterest:', e);
   }
 
-  console.error('ERROR CRITICO: Todos los metodos de extraccion nativa fallaron para:', pageUrl);
+  console.error('ERROR CRITICO: Todos los metodos de extraccion fallaron para:', pageUrl);
   return null;
 }
 
