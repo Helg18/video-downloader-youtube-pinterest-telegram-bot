@@ -1,24 +1,23 @@
 /**
  * @file index.ts
  * @description Bot de Telegram para descarga de videos sin marcas de agua (YouTube, Instagram, Facebook, Pinterest)
- * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), filtrado estricto de archivos `.mp4` para Pinterest
- * (excluyendo listas HLS `.m3u8` no compatibles con Telegram), API v7 de Cobalt para YouTube, respuestas amigables y Estrellas.
+ * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), `@distube/ytdl-core` (importado correctamente como módulo *),
+ * análisis nativo para Pinterest, respuestas amigables con emojis y Estrellas de Telegram.
  * 
  * REGLA DE ORO: Todo el código está comentado detalladamente línea por línea y bloque por bloque en español.
  */
 
 import { Hono } from 'hono';
+import * as ytdl from '@distube/ytdl-core';
 
 /**
  * Interfaz que define las ligaduras (Bindings) inyectadas por Cloudflare Workers.
  * - DB: Conexión a la base de datos Cloudflare D1 (SQLite).
  * - BOT_TOKEN: Token secreto del bot de Telegram obtenido a través de BotFather.
- * - RAPIDAPI_KEY: Clave opcional gratuita de RapidAPI para garantizar descargas estables de YouTube.
  */
 type Bindings = {
   DB: D1Database;
   BOT_TOKEN: string;
-  RAPIDAPI_KEY?: string;
 };
 
 /**
@@ -77,7 +76,7 @@ app.post('/webhook', async (c) => {
 
       if (pending) {
         await sendMessage(token, chatId, '✨ ¡Pago recibido con éxito! Procesando tu video sin marcas de agua... 🎬');
-        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true, c.env.RAPIDAPI_KEY);
+        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true);
         
         await c.env.DB.prepare(
           `INSERT INTO user_purchases (user_id, purchase_count, total_stars_spent)
@@ -170,7 +169,7 @@ app.post('/webhook', async (c) => {
     const videoUrl = matches[0];
     console.log('INFO: Usuario ' + userId + ' solicito descarga para la URL: ' + videoUrl);
 
-    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl, c.env.RAPIDAPI_KEY);
+    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl);
 
     return c.json({ ok: true });
   } catch (err: any) {
@@ -253,7 +252,7 @@ async function sendVideo(token: string, chatId: number | string, directVideoUrl:
 /**
  * Administra la lógica de cuota diaria o emisión de factura de pago.
  */
-async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string, rapidApiKey?: string) {
+async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string) {
   const today = new Date().toISOString().split('T')[0];
 
   const record = await db.prepare(
@@ -264,7 +263,7 @@ async function handleVideoRequest(token: string, db: D1Database, userId: string,
 
   if (successCount < 1) {
     await sendMessage(token, chatId, '⏳ ¡Procesando tu video mágico! Dame un momentito... ✨');
-    await processAndSendVideo(token, db, userId, chatId, videoUrl, false, rapidApiKey);
+    await processAndSendVideo(token, db, userId, chatId, videoUrl, false);
   } else {
     const payload = 'dl_' + userId + '_' + Date.now();
     await db.prepare(
@@ -284,11 +283,10 @@ async function processAndSendVideo(
   userId: string,
   chatId: number | string,
   videoUrl: string,
-  isPaid: boolean,
-  rapidApiKey?: string
+  isPaid: boolean
 ) {
   try {
-    const directUrl = await extractDirectVideoUrl(videoUrl, rapidApiKey);
+    const directUrl = await extractDirectVideoUrl(videoUrl);
 
     if (!directUrl) {
       await sendMessage(
@@ -328,7 +326,6 @@ async function processAndSendVideo(
 function findPinterestMp4Url(obj: any): string | null {
   if (!obj || typeof obj !== 'object') return null;
 
-  // Busca claves comunes de video directo (.mp4)
   if (typeof obj.vod_url === 'string' && obj.vod_url && obj.vod_url.includes('.mp4')) return obj.vod_url;
   if (typeof obj.video_url === 'string' && obj.video_url && obj.video_url.includes('.mp4')) return obj.video_url;
 
@@ -346,39 +343,31 @@ function findPinterestMp4Url(obj: any): string | null {
 }
 
 /**
- * Extrae la URL directa de descarga sin marcas de agua.
- * Filtra estrictamente archivos `.mp4` para Pinterest (descartando `.m3u8` que Telegram no soporta directamente)
- * y utiliza Cobalt v7 para YouTube.
+ * Extrae la URL directa de descarga sin marcas de agua utilizando `@distube/ytdl-core` para YouTube
+ * y análisis nativo (Scraping de __PWS_DATA__) para Pinterest.
  * 
  * @param pageUrl URL pública del video aportada por el usuario.
- * @param rapidApiKey Clave opcional de RapidAPI.
  * @returns Retorna la URL directa del archivo `.mp4` o null si falla.
  */
-async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Promise<string | null> {
-  console.log('DEBUG: Iniciando extraccion para: ' + pageUrl);
+async function extractDirectVideoUrl(pageUrl: string): Promise<string | null> {
+  console.log('DEBUG: Iniciando extraccion nativa para: ' + pageUrl);
 
-  // 1. YouTube o Redes Sociales mediante RapidAPI (si está configurada)
-  if (rapidApiKey) {
-    try {
-      console.log('DEBUG: Consultando RapidAPI...');
-      const response = await fetch('https://youtube-media-downloader.p.rapidapi.com/v2/video/details?url=' + encodeURIComponent(pageUrl), {
-        method: 'GET',
-        headers: {
-          'X-RapidAPI-Key': rapidApiKey,
-          'X-RapidAPI-Host': 'youtube-media-downloader.p.rapidapi.com',
-        },
-      });
-      const data = await response.json() as any;
-      if (data?.videos?.items?.[0]?.url) {
-        console.log('SUCCESS: Video de YouTube obtenido mediante RapidAPI.');
-        return data.videos.items[0].url;
+  // 1. Extracción nativa de YouTube utilizando @distube/ytdl-core
+  try {
+    if (ytdl.validateURL(pageUrl)) {
+      console.log('DEBUG: Validado URL de YouTube. Resolviendo info con ytdl-core...');
+      const info = await ytdl.getInfo(pageUrl);
+      const format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'videoandaudio' });
+      if (format && format.url) {
+        console.log('SUCCESS: Stream directo de YouTube obtenido con ytdl-core.');
+        return format.url;
       }
-    } catch (e) {
-      console.error('ERROR: Fallo la peticion a RapidAPI:', e);
     }
+  } catch (e) {
+    console.error('ERROR: ytdl-core fallo al procesar YouTube:', e);
   }
 
-  // 2. Extracción avanzada para Pinterest (filtrando estrictamente por archivos .mp4)
+  // 2. Extracción nativa para Pinterest (analizando __PWS_DATA__ JSON y archivos .mp4)
   try {
     if (pageUrl.includes('pin.it') || pageUrl.includes('pinterest.com')) {
       console.log('DEBUG: Realizando analisis avanzado de Pinterest...');
@@ -391,15 +380,13 @@ async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Pro
       });
       
       const html = await res.text();
-      console.log('DEBUG: Pinterest response status: ' + res.status + ', length: ' + html.length);
-
       const pwsMatch = html.match(/<script[^>]*id=["']__PWS_DATA__[^>]*>([\s\S]*?)<\/script>/i);
       if (pwsMatch && pwsMatch[1]) {
         try {
           const pwsJson = JSON.parse(pwsMatch[1]);
           const mp4Url = findPinterestMp4Url(pwsJson);
           if (mp4Url) {
-            console.log('SUCCESS: Video .mp4 de Pinterest extraido de __PWS_DATA__:', mp4Url);
+            console.log('SUCCESS: Video .mp4 de Pinterest extraido de __PWS_DATA__.');
             return mp4Url.replace(/&amp;/g, '&');
           }
         } catch (jsonErr) {
@@ -407,52 +394,27 @@ async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Pro
         }
       }
 
-      // Regex estricta para capturar únicamente archivos .mp4 (excluyendo .m3u8)
       const pinMp4Regex = /(https:\/\/[^"'\s]+\.mp4[^"'\s]*)/i;
       const match = html.match(pinMp4Regex);
       if (match && match[1]) {
-        console.log('SUCCESS: Video .mp4 de Pinterest extraido mediante regex:', match[1]);
+        console.log('SUCCESS: Video .mp4 de Pinterest extraido mediante regex.');
         return match[1].replace(/&amp;/g, '&');
       }
-
-      console.warn('WARN: No se pudo encontrar un archivo .mp4 válido en Pinterest.');
     }
   } catch (e) {
     console.error('ERROR: Excepcion analizando Pinterest:', e);
   }
 
-  // 3. Intento de respaldo con la API oficial de Cobalt (v7)
-  try {
-    console.log('DEBUG: Probando API oficial de Cobalt (v7)...');
-    const res = await fetch('https://api.cobalt.tools/api/json', {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Origin': 'https://cobalt.tools',
-        'Referer': 'https://cobalt.tools/'
-      },
-      body: JSON.stringify({ url: pageUrl, videoQuality: '720' }),
-    });
-    const text = await res.text();
-    if (!text.startsWith('<!DOCTYPE') && !text.startsWith('<html')) {
-      const data = JSON.parse(text);
-      if (data?.url) {
-        console.log('SUCCESS: Video extraido de Cobalt oficial.');
-        return data.url;
-      }
-      if (data?.picker && data.picker[0]?.url) {
-        console.log('SUCCESS: Video extraido de picker en Cobalt oficial.');
-        return data.picker[0].url;
-      }
-    }
-  } catch (e) {
-    console.error('ERROR: Cobalt oficial fallo:', e);
-  }
-
-  console.error('ERROR CRITICO: Todos los metodos de extraccion fallaron para:', pageUrl);
+  console.error('ERROR CRITICO: Todos los metodos de extraccion nativa fallaron para:', pageUrl);
   return null;
 }
+
+app.post('/reset-db', async (c) => {
+  return c.text('DB reset endpoint ready');
+});
+
+app.post('/reset-db', async (c) => {
+  return c.text('DB reset endpoint ready');
+});
 
 export default app;
