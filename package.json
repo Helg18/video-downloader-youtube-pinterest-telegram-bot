@@ -1,0 +1,17 @@
+{
+  "name": "telegram-video-bot-cf",
+  "version": "1.0.0",
+  "description": "Telegram video downloader bot on Cloudflare Workers with Telegram Stars monetization",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240925.0",
+    "wrangler": "^3.78.1"
+  }
+}

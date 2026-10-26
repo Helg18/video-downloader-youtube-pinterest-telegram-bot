@@ -1,0 +1,11 @@
+name = "telegram-video-bot"
+main = "src/index.ts"
+compatibility_date = "2024-10-26"
+
+[vars]
+# Define your bot username or other non-secret vars here if needed
+
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-bot-db"
+database_id = "bc318290-ed3a-4130-a4fd-5692d240e44d"
