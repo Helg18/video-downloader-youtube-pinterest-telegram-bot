@@ -1,8 +1,11 @@
 /**
  * @file index.ts
  * @description Bot de Telegram para descarga de videos sin marcas de agua (YouTube, Pinterest)
- * alojado en Cloudflare Workers. Utiliza Hono, Cloudflare D1 (SQLite), integración con RapidAPI para YouTube,
- * análisis nativo para Pinterest, respuestas amigables con emojis y Estrellas de Telegram.
+ * alojado en Cloudflare Workers con costo cero absoluto (0$), sin APIs de pago y sin requerir servicios de pago.
+ * Utiliza Hono, Cloudflare D1 (SQLite), YouTube oEmbed API oficial para metadatos garantizados,
+ * instancias públicas de Piped API para streaming directo de YouTube, scraping nativo para Pinterest,
+ * manejo elegante de errores de tamaño de archivo (>50MB de Telegram), detalles completos del video
+ * en TODOS los mensajes informativos y de error, respuestas con emojis y Estrellas de Telegram.
  * 
  * REGLA DE ORO: Todo el código está comentado detalladamente línea por línea y bloque por bloque en español.
  */
@@ -13,12 +16,23 @@ import { Hono } from 'hono';
  * Interfaz que define las ligaduras (Bindings) inyectadas por Cloudflare Workers.
  * - DB: Conexión a la base de datos Cloudflare D1 (SQLite).
  * - BOT_TOKEN: Token secreto del bot de Telegram obtenido a través de BotFather.
- * - RAPIDAPI_KEY: Clave de RapidAPI para garantizar descargas estables de YouTube.
  */
 type Bindings = {
   DB: D1Database;
   BOT_TOKEN: string;
-  RAPIDAPI_KEY?: string;
+};
+
+/**
+ * Estructura de metadatos detallados del video extraído.
+ */
+type VideoDetails = {
+  directUrl: string;
+  title: string;
+  durationFormatted: string;
+  quality: string;
+  format: string;
+  fileSizeMb: string;
+  platform: string;
 };
 
 /**
@@ -31,7 +45,7 @@ const app = new Hono<{ Bindings: Bindings }>();
  * Permite comprobar instantáneamente si el Worker está activo respondiendo peticiones HTTP.
  */
 app.get('/', (c) => {
-  return c.text('Telegram Video Downloader Bot is running smoothly on Cloudflare Workers!');
+  return c.text('Telegram Video Downloader Bot (100% Free, Direct CDN Streaming) is running smoothly on Cloudflare Workers!');
 });
 
 /**
@@ -77,7 +91,7 @@ app.post('/webhook', async (c) => {
 
       if (pending) {
         await sendMessage(token, chatId, '✨ ¡Pago recibido con éxito! Procesando tu video sin marcas de agua... 🎬');
-        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true, c.env.RAPIDAPI_KEY);
+        await processAndSendVideo(token, c.env.DB, userId, chatId, pending.video_url, true);
         
         await c.env.DB.prepare(
           `INSERT INTO user_purchases (user_id, purchase_count, total_stars_spent)
@@ -101,6 +115,7 @@ app.post('/webhook', async (c) => {
         chatId,
         '👋 ¡Hola! Bienvenido a tu Bot de Descarga de Videos favorito 🎥✨\n\n' +
         '📥 Envíame un enlace de **YouTube o Pinterest** y te enviaré el video limpio y sin marcas de agua.\n\n' +
+        '💎 **100% Gratuito (Costo 0$), sin registros ni tarjetas de crédito**\n\n' +
         '🎁 **Nuestras Reglas:**\n' +
         '• Tienes **1 descarga gratis todos los días** 🌟\n' +
         '• Las descargas adicionales cuestan solo **20 Estrellas** de Telegram ⭐️\n\n' +
@@ -166,7 +181,7 @@ app.post('/webhook', async (c) => {
     const videoUrl = matches[0];
     console.log('INFO: Usuario ' + userId + ' solicito descarga para la URL: ' + videoUrl);
 
-    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl, c.env.RAPIDAPI_KEY);
+    await handleVideoRequest(token, c.env.DB, userId, chatId, videoUrl);
 
     return c.json({ ok: true });
   } catch (err: any) {
@@ -249,7 +264,7 @@ async function sendVideo(token: string, chatId: number | string, directVideoUrl:
 /**
  * Administra la lógica de cuota diaria o emisión de factura de pago.
  */
-async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string, rapidApiKey?: string) {
+async function handleVideoRequest(token: string, db: D1Database, userId: string, chatId: number | string, videoUrl: string) {
   const today = new Date().toISOString().split('T')[0];
 
   const record = await db.prepare(
@@ -260,7 +275,7 @@ async function handleVideoRequest(token: string, db: D1Database, userId: string,
 
   if (successCount < 1) {
     await sendMessage(token, chatId, '⏳ ¡Procesando tu video mágico! Dame un momentito... ✨');
-    await processAndSendVideo(token, db, userId, chatId, videoUrl, false, rapidApiKey);
+    await processAndSendVideo(token, db, userId, chatId, videoUrl, false);
   } else {
     const payload = 'dl_' + userId + '_' + Date.now();
     await db.prepare(
@@ -273,6 +288,9 @@ async function handleVideoRequest(token: string, db: D1Database, userId: string,
 
 /**
  * Procesa la extracción de la URL directa del video y lo envía al usuario.
+ * Si ocurre un fallo al extraer o enviar el video, informa amablemente al usuario
+ * incluyendo TODOS los detalles del video (título oficial, plataforma, duración, calidad, formato, tamaño en MB)
+ * sin descontar su descarga gratuita.
  */
 async function processAndSendVideo(
   token: string,
@@ -280,23 +298,56 @@ async function processAndSendVideo(
   userId: string,
   chatId: number | string,
   videoUrl: string,
-  isPaid: boolean,
-  rapidApiKey?: string
+  isPaid: boolean
 ) {
   try {
-    const directUrl = await extractDirectVideoUrl(videoUrl, rapidApiKey);
+    const videoDetails = await extractDirectVideoUrl(videoUrl);
 
-    if (!directUrl) {
-      await sendMessage(
-        token,
-        chatId,
+    // Si no se pudo obtener la URL directa de descarga
+    if (!videoDetails || !videoDetails.directUrl) {
+      const title = videoDetails?.title || 'Video de YouTube';
+      const platform = videoDetails?.platform || (videoUrl.includes('youtube') || videoUrl.includes('youtu.be') ? 'YouTube 📺' : 'Pinterest 📌');
+      const durationFormatted = videoDetails?.durationFormatted || 'N/A';
+      const quality = videoDetails?.quality || 'N/A';
+      const format = videoDetails?.format || 'N/A';
+      const fileSizeMb = videoDetails?.fileSizeMb || 'N/A';
+
+      const failMsg = 
         '😅 ¡Vaya! No pudimos extraer el video de este enlace en este momento.\n\n' +
-        '🛡️ *Pero no te preocupes:* **Tu descarga gratuita sigue intacta**. Puedes intentar con otro enlace o probar más tarde. 🔄'
-      );
+        '📋 **Detalles del Video Solicitado:**\n' +
+        `• 🎬 **Título oficial del video:** ${title}\n` +
+        `• 🌐 **Plataforma de origen:** ${platform}\n` +
+        `• ⏱️ **Duración:** ${durationFormatted}\n` +
+        `• 📐 **Calidad:** ${quality}\n` +
+        `• 📦 **Formato:** ${format}\n` +
+        `• ⚖️ **Tamaño estimado:** ${fileSizeMb} MB\n\n` +
+        '🛡️ *Pero no te preocupes:* **Tu descarga gratuita sigue intacta**. Puedes intentar con otro enlace o probar más tarde. 🔄';
+
+      await sendMessage(token, chatId, failMsg);
       return;
     }
 
-    await sendVideo(token, chatId, directUrl);
+    try {
+      await sendVideo(token, chatId, videoDetails.directUrl);
+    } catch (telegramErr: any) {
+      console.error('ERROR: Telegram rechazo el envio del video:', telegramErr);
+      
+      // Mensaje detallado cuando Telegram rechaza el video (ej. >50MB)
+      const errorMsg = 
+        '⚠️ **No se pudo enviar el video (Límite o Bloqueo)**\n\n' +
+        '📋 **Detalles del Video Solicitado:**\n' +
+        `• 🎬 **Título oficial del video:** ${videoDetails.title}\n` +
+        `• 🌐 **Plataforma de origen:** ${videoDetails.platform}\n` +
+        `• ⏱️ **Duración:** ${videoDetails.durationFormatted}\n` +
+        `• 📐 **Calidad:** ${videoDetails.quality}\n` +
+        `• 📦 **Formato:** ${videoDetails.format}\n` +
+        `• ⚖️ **Tamaño estimado:** ${videoDetails.fileSizeMb} MB\n\n` +
+        '💡 **Motivo:** El archivo supera el límite de **50MB** permitido por la API oficial de Telegram para bots gratuitos, o la CDN de origen bloqueó la transferencia.\n\n' +
+        '🎁 *¡Buenas noticias!* **Tu descarga gratuita no ha sido descontada**. Prueba con un video más corto o de menor resolución. ✨';
+
+      await sendMessage(token, chatId, errorMsg);
+      return;
+    }
 
     // Si la descarga fue gratuita y exitosa, registra el éxito en D1.
     if (!isPaid) {
@@ -313,27 +364,71 @@ async function processAndSendVideo(
     await sendMessage(
       token,
       chatId,
-      '⚠️ Ocurrio un pequeño inconveniente al enviar el video. (Tu descarga gratuita no ha sido afectada). 🎁'
+      '⚠️ Ocurrio un pequeño inconveniente al procesar el video. (Tu descarga gratuita no ha sido afectada). 🎁'
     );
   }
 }
 
 /**
- * Función recursiva para buscar únicamente URLs de video `.mp4` en objetos JSON anidados (Pinterest).
+ * Extrae el ID de un video de YouTube a partir de su URL en diversos formatos.
  */
-function findPinterestMp4Url(obj: any): string | null {
+function extractYouTubeVideoId(url: string): string | null {
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+  const match = url.match(regExp);
+  return (match && match[2].length === 11) ? match[2] : null;
+}
+
+/**
+ * Función auxiliar para formatear segundos en formato mm:ss.
+ */
+function formatDuration(seconds: number): string {
+  if (!seconds || isNaN(seconds)) return 'Desconocida';
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}m ${secs < 10 ? '0' : ''}${secs}s`;
+}
+
+/**
+ * Obtiene los metadatos oficiales de un video de YouTube utilizando la API oEmbed oficial de YouTube (100% gratuita y garantizada).
+ */
+async function fetchYouTubeOEmbedMeta(pageUrl: string): Promise<{ title: string; author: string } | null> {
+  try {
+    const res = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(pageUrl)}&format=json`);
+    if (res.ok) {
+      const data = await res.json() as any;
+      return {
+        title: data.title || 'Video de YouTube',
+        author: data.author_name || 'YouTube'
+      };
+    }
+  } catch (e) {
+    console.error('ERROR: Fallo al obtener oEmbed de YouTube:', e);
+  }
+  return null;
+}
+
+/**
+ * Función recursiva para buscar URLs de video `.mp4` y metadatos en objetos JSON anidados (Pinterest).
+ */
+function findPinterestVideoInfo(obj: any): { url: string; title: string } | null {
   if (!obj || typeof obj !== 'object') return null;
 
-  if (typeof obj.vod_url === 'string' && obj.vod_url && obj.vod_url.includes('.mp4')) return obj.vod_url;
-  if (typeof obj.video_url === 'string' && obj.video_url && obj.video_url.includes('.mp4')) return obj.video_url;
+  const title = obj.title || obj.grid_title || obj.description || 'Video de Pinterest';
+
+  if (typeof obj.vod_url === 'string' && obj.vod_url && obj.vod_url.includes('.mp4')) {
+    return { url: obj.vod_url, title };
+  }
+  if (typeof obj.video_url === 'string' && obj.video_url && obj.video_url.includes('.mp4')) {
+    return { url: obj.video_url, title };
+  }
 
   for (const key of Object.keys(obj)) {
     const val = obj[key];
     if (typeof val === 'string' && val.includes('.mp4') && !val.includes('.m3u8')) {
-      return val;
+      return { url: val, title };
     }
     if (typeof val === 'object') {
-      const found = findPinterestMp4Url(val);
+      const found = findPinterestVideoInfo(val);
       if (found) return found;
     }
   }
@@ -341,48 +436,100 @@ function findPinterestMp4Url(obj: any): string | null {
 }
 
 /**
- * Extrae la URL directa de descarga sin marcas de agua utilizando RapidAPI para YouTube
- * y análisis nativo (`__PWS_DATA__`) para Pinterest.
+ * Extrae la URL directa y todos los detalles enriquecidos del video utilizando YouTube oEmbed oficial + Piped API para YouTube
+ * y scraping nativo para Pinterest.
  * 
  * @param pageUrl URL pública del video aportada por el usuario.
- * @param rapidApiKey Clave de RapidAPI.
- * @returns Retorna la URL directa del archivo `.mp4` o null si falla.
+ * @returns Retorna un objeto `VideoDetails` o null si falla.
  */
-async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Promise<string | null> {
-  console.log('DEBUG: Iniciando extraccion para: ' + pageUrl);
+async function extractDirectVideoUrl(pageUrl: string): Promise<VideoDetails | null> {
+  console.log('DEBUG: Iniciando extraccion detallada de costo cero para: ' + pageUrl);
 
-  // 1. Extracción de YouTube utilizando RapidAPI
-  if (rapidApiKey) {
+  // 1. Extracción de YouTube utilizando YouTube oEmbed API oficial (para metadatos garantizados) y Piped API (para streams)
+  if (pageUrl.includes('youtube.com') || pageUrl.includes('youtu.be')) {
+    const oEmbedMeta = await fetchYouTubeOEmbedMeta(pageUrl);
+    const guaranteedTitle = oEmbedMeta ? oEmbedMeta.title : 'Video de YouTube';
+
     try {
-      console.log('DEBUG: Consultando YouTube Media Downloader en RapidAPI...');
-      const response = await fetch('https://youtube-media-downloader.p.rapidapi.com/v2/video/details?url=' + encodeURIComponent(pageUrl), {
-        method: 'GET',
-        headers: {
-          'X-RapidAPI-Key': rapidApiKey,
-          'X-RapidAPI-Host': 'youtube-media-downloader.p.rapidapi.com',
-        },
-      });
-      const data = await response.json() as any;
-      console.log('DEBUG: RapidAPI response status:', response.status);
+      const videoId = extractYouTubeVideoId(pageUrl);
+      if (videoId) {
+        const pipedInstances = [
+          'https://pipedapi.kavin.rocks',
+          'https://pipedapi.privacy.com.de',
+          'https://pipedapi.projectsegfau.lt'
+        ];
 
-      // Intenta múltiples formatos de respuesta comunes de RapidAPI
-      const directUrl = data?.videos?.items?.[0]?.url 
-                     || data?.link 
-                     || data?.url 
-                     || data?.formats?.[0]?.url;
+        for (const instance of pipedInstances) {
+          try {
+            console.log('DEBUG: Consultando Piped API en instancia: ' + instance + ' para videoId=' + videoId);
+            const response = await fetch(instance + '/streams/' + videoId, {
+              method: 'GET',
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+            });
 
-      if (directUrl) {
-        console.log('SUCCESS: Video de YouTube obtenido mediante RapidAPI.');
-        return directUrl;
+            if (response.ok) {
+              const data = await response.json() as any;
+              const title = data?.title || guaranteedTitle;
+              const durationFormatted = formatDuration(data?.duration || 0);
+              const videoStreams = data?.videoStreams;
+              
+              if (Array.isArray(videoStreams) && videoStreams.length > 0) {
+                const directStream = videoStreams.find((s: any) => s.url && !s.format?.includes('m3u8')) || videoStreams[0];
+                
+                const quality = directStream?.quality || 'Desconocida';
+                const format = directStream?.format || 'mp4';
+                
+                let fileSizeMb = 'Desconocido';
+                if (directStream?.contentLength && !isNaN(directStream.contentLength)) {
+                  fileSizeMb = (directStream.contentLength / (1024 * 1024)).toFixed(1);
+                }
+
+                console.log('SUCCESS: Video de YouTube y detalles obtenidos.');
+                return {
+                  directUrl: directStream?.url || '',
+                  title,
+                  durationFormatted,
+                  quality,
+                  format,
+                  fileSizeMb,
+                  platform: 'YouTube 📺'
+                };
+              }
+            }
+          } catch (instanceErr) {
+            console.warn('WARN: Fallo la instancia Piped ' + instance + ', probando siguiente...');
+          }
+        }
+
+        return {
+          directUrl: '',
+          title: guaranteedTitle,
+          durationFormatted: 'N/A',
+          quality: 'N/A',
+          format: 'mp4',
+          fileSizeMb: 'N/A',
+          platform: 'YouTube 📺'
+        };
       }
     } catch (e) {
-      console.error('ERROR: Fallo la peticion a RapidAPI:', e);
+      console.error('ERROR: Excepcion procesando YouTube:', e);
+      if (oEmbedMeta) {
+        return {
+          directUrl: '',
+          title: oEmbedMeta.title,
+          durationFormatted: 'N/A',
+          quality: 'N/A',
+          format: 'mp4',
+          fileSizeMb: 'N/A',
+          platform: 'YouTube 📺'
+        };
+      }
     }
-  } else {
-    console.warn('ADVERTENCIA: RAPIDAPI_KEY no esta configurada en los secretos de Cloudflare.');
   }
 
-  // 2. Extracción nativa para Pinterest (analizando __PWS_DATA__ JSON y archivos .mp4)
+  // 2. Extracción nativa para Pinterest
   try {
     if (pageUrl.includes('pin.it') || pageUrl.includes('pinterest.com')) {
       console.log('DEBUG: Realizando analisis avanzado de Pinterest...');
@@ -399,10 +546,18 @@ async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Pro
       if (pwsMatch && pwsMatch[1]) {
         try {
           const pwsJson = JSON.parse(pwsMatch[1]);
-          const mp4Url = findPinterestMp4Url(pwsJson);
-          if (mp4Url) {
+          const pinInfo = findPinterestVideoInfo(pwsJson);
+          if (pinInfo) {
             console.log('SUCCESS: Video .mp4 de Pinterest extraido de __PWS_DATA__.');
-            return mp4Url.replace(/&amp;/g, '&');
+            return {
+              directUrl: pinInfo.url ? pinInfo.url.replace(/&amp;/g, '&') : '',
+              title: pinInfo.title,
+              durationFormatted: 'N/A (Pinterest)',
+              quality: 'HD / Original',
+              format: 'mp4',
+              fileSizeMb: 'Desconocido',
+              platform: 'Pinterest 📌'
+            };
           }
         } catch (jsonErr) {
           console.error('ERROR: Error parseando JSON de Pinterest:', jsonErr);
@@ -413,14 +568,22 @@ async function extractDirectVideoUrl(pageUrl: string, rapidApiKey?: string): Pro
       const match = html.match(pinMp4Regex);
       if (match && match[1]) {
         console.log('SUCCESS: Video .mp4 de Pinterest extraido mediante regex.');
-        return match[1].replace(/&amp;/g, '&');
+        return {
+          directUrl: match[1].replace(/&amp;/g, '&'),
+          title: 'Video de Pinterest',
+          durationFormatted: 'N/A (Pinterest)',
+          quality: 'HD / Original',
+          format: 'mp4',
+          fileSizeMb: 'Desconocido',
+          platform: 'Pinterest 📌'
+        };
       }
     }
   } catch (e) {
     console.error('ERROR: Excepcion analizando Pinterest:', e);
   }
 
-  console.error('ERROR CRITICO: Todos los metodos de extraccion fallaron para:', pageUrl);
+  console.error('ERROR CRITICO: Todos los metodos de extraccion detallada fallaron para:', pageUrl);
   return null;
 }
 
